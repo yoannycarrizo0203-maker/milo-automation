@@ -3,7 +3,10 @@ import json
 from datetime import datetime, timezone
 from execution.utils.db import get_db_connection
 from execution.utils.logging import logger
-from execution.config import openai_client, OPENAI_MODEL, MAX_TOKENS, OPENAI_TIMEOUT
+from execution.config import openai_client, OPENAI_MODEL, MAX_TOKENS, OPENAI_TIMEOUT, OWNER_PHONE_NUMBER
+from execution.connectors.twilio import TwilioConnector
+
+twilio_client = TwilioConnector()
 
 def process_enrichment():
     """
@@ -29,12 +32,14 @@ def process_enrichment():
         if tc and tc['paused']:
              logger.info(f"Thread {thread_id} paused. Routing {msg_id} to NEEDS_REVIEW.")
              update_status(conn, msg_id, "NEEDS_REVIEW")
+             notify_owner(conn, "NEEDS_REVIEW", f"Thread Paused", msg_id, sender)
              continue
 
         # Rule 3: Media/Body Check
         if media != "{}" or not body.strip():
             logger.info(f"Message {msg_id} has media or empty body. Routing to NEEDS_REVIEW.")
             update_status(conn, msg_id, "NEEDS_REVIEW")
+            notify_owner(conn, "NEEDS_REVIEW", "Media/Empty Body context", msg_id, sender)
             continue
             
         # AI Classification & Drafting
@@ -58,23 +63,27 @@ def process_enrichment():
             if lang not in ["EN", "ES"] or lang == "UNCLEAR":
                 logger.info(f"Language {lang} not supported/unclear. Needs Review.")
                 update_status(conn, msg_id, "NEEDS_REVIEW")
+                notify_owner(conn, "NEEDS_REVIEW", f"Language {lang} (Conf: {confidence})", msg_id, sender, body)
                 continue
                 
             if confidence < 0.75:
                  logger.info(f"Language Confidence Low ({confidence}). Needs Review.")
                  update_status(conn, msg_id, "NEEDS_REVIEW")
+                 notify_owner(conn, "NEEDS_REVIEW", f"Low Confidence ({confidence})", msg_id, sender, body)
                  continue
 
             # Risk Check
             if risk == "HIGH":
                 logger.info(f"Risk HIGH ({risk_reason}) for {msg_id}. Needs Review.")
                 update_status(conn, msg_id, "NEEDS_REVIEW")
+                notify_owner(conn, "NEEDS_REVIEW", f"Risk HIGH ({risk_reason})", msg_id, sender, body)
                 continue
             
             # Intent Check    
             if intent == "UNKNOWN":
                 logger.info(f"Intent UNKNOWN for {msg_id}. Needs Review.")
                 update_status(conn, msg_id, "NEEDS_REVIEW")
+                notify_owner(conn, "NEEDS_REVIEW", "Intent UNKNOWN", msg_id, sender, body)
                 continue
                 
             # 2. Drafting
@@ -104,13 +113,76 @@ def process_enrichment():
             
             update_status(conn, msg_id, "DRAFT_PENDING_APPROVAL") 
             logger.info(f"Generated draft {draft_id} for message {msg_id}")
+            
+            # Notify Owner (Draft Ready)
+            notify_owner(conn, "DRAFT_READY", draft_body, msg_id, sender)
 
         except Exception as e:
             logger.error(f"AI Enrichment failed for {msg_id}: {e}")
             update_status(conn, msg_id, "NEEDS_REVIEW")
+            notify_owner(conn, "NEEDS_REVIEW", f"Enrichment Exception: {str(e)}", msg_id, sender)
             
     conn.commit()
     conn.close()
+
+def notify_owner(conn, event_type, context, msg_id, thread_phone, body_snippet=None):
+    """
+    Sends operational SMS to OWNER_PHONE_NUMBER. Bypasses ENABLE_SENDING.
+    """
+    if not OWNER_PHONE_NUMBER:
+        logger.warning("No OWNER_PHONE_NUMBER set. Skipping notification.")
+        return
+
+    # Idempotency Check (Session-based via Audit Log)
+    c = conn.cursor()
+    # Check if we already notified for this msg_id + event
+    # We look for standard event string
+    audit_event = f"OWNER_NOTIFIED_{event_type}"
+    c.execute("SELECT id FROM audit_log WHERE event = ? AND metadata LIKE ?", (audit_event, f'%"{msg_id}"%'))
+    if c.fetchone():
+        logger.info(f"Skipping duplicate notification {event_type} for {msg_id}")
+        return
+
+    logger.info(f"OWNER_NOTIFY_ATTEMPT: {event_type} for {msg_id}")
+    
+    prefix = "DRAFT READY" if event_type == "DRAFT_READY" else "NEEDS REVIEW"
+    
+    # Construct Message
+    message_lines = [
+        f"{prefix}",
+        f"Thread: {thread_phone}",
+        f"Msg: {msg_id}",
+    ]
+    
+    if event_type == "DRAFT_READY":
+        # Context is draft_body
+        truncated_draft = (context[:100] + '...') if len(context) > 100 else context
+        message_lines.append(f"Draft: {truncated_draft}")
+        message_lines.append("Reply A <id>, R <id>, E <id> <text>")
+    else:
+        # Context is reason
+        message_lines.append(f"Reason: {context}")
+        if body_snippet:
+             start = (body_snippet[:50] + '...') if len(body_snippet) > 50 else body_snippet
+             message_lines.append(f"Snippet: {start}")
+             
+    full_body = "\n".join(message_lines)
+    
+    try:
+        # Send SMS (Operational - Force Send)
+        sid = twilio_client.send_sms(OWNER_PHONE_NUMBER, full_body)
+        
+        logger.info(f"OWNER_NOTIFY_OK: SID={sid}")
+        
+        # Audit Log
+        audit_id = str(uuid.uuid4())
+        now_ui = datetime.now(timezone.utc).isoformat()
+        c.execute("INSERT INTO audit_log (id, event, actor, metadata, timestamp) VALUES (?, ?, ?, ?, ?)",
+                  (audit_id, audit_event, "SYSTEM", json.dumps({"msg_id": msg_id, "sid": sid}), now_ui))
+        # Note: We commit in the main loop, but if we want to secure this log, we rely on main loop commit
+        
+    except Exception as e:
+        logger.error(f"OWNER_NOTIFY_FAIL: {e}")
 
 def classify_message(body):
     """

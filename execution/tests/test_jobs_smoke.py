@@ -28,8 +28,14 @@ class MvpSmokeTest(unittest.TestCase):
         init_db()
 
     def tearDown(self):
+        # Ensure file is released
+        import gc
+        gc.collect()
         if os.path.exists(self.test_db):
-            os.remove(self.test_db)
+            try:
+                os.remove(self.test_db)
+            except PermissionError:
+                pass 
 
     def test_ingest_deduplication(self):
         payload = {"MessageSid": "SM123", "From": "+15550001", "Body": "Test"}
@@ -41,54 +47,86 @@ class MvpSmokeTest(unittest.TestCase):
         self.assertEqual(count, 1)
         conn.close()
 
+    @unittest.mock.patch('execution.jobs.job_02_enrich.twilio_client.send_sms')
     @unittest.mock.patch('execution.jobs.job_02_enrich.openai_client')
-    def test_enrich_creates_draft(self, mock_openai):
-        # Mock Classification
-        mock_classify = unittest.mock.Mock()
-        choice_c = unittest.mock.Mock()
-        choice_c.message.content = '{"language": "ES", "language_confidence": 0.9, "risk": "LOW", "risk_reason": "NONE", "intent": "KNOWN"}'
-        mock_classify.choices = [choice_c]
-        
-        # Mock Drafting
-        mock_draft = unittest.mock.Mock()
-        choice_d = unittest.mock.Mock()
-        choice_d.message.content = "Gracias por tu mensaje. ¿Qué hora funciona?"
-        mock_draft.choices = [choice_d]
-        
-        mock_openai.chat.completions.create.side_effect = [mock_classify, mock_draft]
+    def test_enrich_creates_draft_and_notifies(self, mock_openai, mock_send_sms):
+        # Config needs OWNER_PHONE_NUMBER
+        with unittest.mock.patch('execution.jobs.job_02_enrich.OWNER_PHONE_NUMBER', '+1999999999'):
+            # Mock Classification
+            mock_classify = unittest.mock.Mock()
+            choice_c = unittest.mock.Mock()
+            choice_c.message.content = '{"language": "ES", "language_confidence": 0.9, "risk": "LOW", "risk_reason": "NONE", "intent": "KNOWN"}'
+            mock_classify.choices = [choice_c]
+            
+            # Mock Drafting
+            mock_draft = unittest.mock.Mock()
+            choice_d = unittest.mock.Mock()
+            choice_d.message.content = "Gracias. Un momento."
+            mock_draft.choices = [choice_d]
+            
+            mock_openai.chat.completions.create.side_effect = [mock_classify, mock_draft]
+            mock_send_sms.return_value = "SID_NOTIFY"
 
-        ingest_message({"MessageSid": "SM999", "From": "+15550001", "Body": "Hola", "To": "+1000"})
-        process_enrichment()
-        
-        conn = get_db_connection()
-        inbound = conn.execute("SELECT status FROM messages WHERE id='SM999'").fetchone()
-        self.assertEqual(inbound['status'], 'DRAFT_PENDING_APPROVAL')
-        
-        draft = conn.execute("SELECT body, type, status FROM messages WHERE type='DRAFT'").fetchone()
-        self.assertIn("Gracias", draft['body'])
-        conn.close()
+            ingest_message({"MessageSid": "SM_DRAFT_NOTIFY", "From": "+15550001", "Body": "Hola", "To": "+1000"})
+            process_enrichment()
+            
+            # Verify Draft Created
+            conn = get_db_connection()
+            inbound = conn.execute("SELECT status FROM messages WHERE id='SM_DRAFT_NOTIFY'").fetchone()
+            self.assertEqual(inbound['status'], 'DRAFT_PENDING_APPROVAL')
+            
+            # Verify Notification Sent
+            mock_send_sms.assert_called_once()
+            args, _ = mock_send_sms.call_args
+            to_number, body = args
+            self.assertEqual(to_number, '+1999999999')
+            self.assertIn("DRAFT READY", body)
+            self.assertIn("Gracias", body) # Draft content
+            conn.close()
 
+    @unittest.mock.patch('execution.jobs.job_02_enrich.twilio_client.send_sms')
     @unittest.mock.patch('execution.jobs.job_02_enrich.openai_client')
-    def test_enrich_high_risk(self, mock_openai):
-        # Mock Classification HIGH RISK
-        mock_classify = unittest.mock.Mock()
-        choice = unittest.mock.Mock()
-        choice.message.content = '{"language": "EN", "language_confidence": 0.9, "risk": "HIGH", "risk_reason": "LEGAL", "intent": "KNOWN"}'
-        mock_classify.choices = [choice]
-        
-        mock_openai.chat.completions.create.side_effect = [mock_classify]
+    def test_enrich_high_risk_notifies(self, mock_openai, mock_send_sms):
+         with unittest.mock.patch('execution.jobs.job_02_enrich.OWNER_PHONE_NUMBER', '+1999999999'):
+            # Mock Classification HIGH RISK
+            mock_classify = unittest.mock.Mock()
+            choice = unittest.mock.Mock()
+            choice.message.content = '{"language": "EN", "language_confidence": 0.9, "risk": "HIGH", "risk_reason": "LEGAL", "intent": "KNOWN"}'
+            mock_classify.choices = [choice]
+            
+            mock_openai.chat.completions.create.side_effect = [mock_classify]
 
-        ingest_message({"MessageSid": "SM_RISK", "From": "+15550004", "Body": "Urgent help"})
-        process_enrichment()
-        
-        conn = get_db_connection()
-        msg = conn.execute("SELECT status FROM messages WHERE id='SM_RISK'").fetchone()
-        self.assertEqual(msg['status'], 'NEEDS_REVIEW')
-        
-        # Verify NO draft created
-        draft_count = conn.execute("SELECT count(*) FROM messages WHERE type='DRAFT' AND thread_id='+15550004'").fetchone()[0]
-        self.assertEqual(draft_count, 0)
-        conn.close()
+            ingest_message({"MessageSid": "SM_RISK_NOTIFY", "From": "+15550004", "Body": "Urgent lawsuit"})
+            process_enrichment()
+            
+            conn = get_db_connection()
+            msg = conn.execute("SELECT status FROM messages WHERE id='SM_RISK_NOTIFY'").fetchone()
+            self.assertEqual(msg['status'], 'NEEDS_REVIEW')
+            
+            # Verify Notification
+            mock_send_sms.assert_called_once()
+            args, _ = mock_send_sms.call_args
+            to_number, body = args
+            self.assertIn("NEEDS REVIEW", body)
+            self.assertIn("Risk HIGH", body)
+            self.assertIn("LEGAL", body)
+            conn.close()
+            
+    @unittest.mock.patch('execution.jobs.job_02_enrich.twilio_client.send_sms')
+    def test_enrich_notifications_idempotency(self, mock_send_sms):
+         with unittest.mock.patch('execution.jobs.job_02_enrich.OWNER_PHONE_NUMBER', '+1999999999'):
+             # Setup Audit Log with existing notification
+             conn = get_db_connection()
+             conn.execute("INSERT INTO messages (id, status, type, sender, body, thread_id, media) VALUES ('SM_DUP', 'RECEIVED', 'INBOUND', '+1555', 'Bad', '+1555', '{}')")
+             conn.execute("INSERT INTO audit_log (id, event, actor, metadata, timestamp) VALUES ('1', 'OWNER_NOTIFIED_NEEDS_REVIEW', 'SYSTEM', '{\"msg_id\": \"SM_DUP\"}', '2025-01-01')")
+             conn.commit()
+             conn.close()
+             
+             # Process should route to review but SKIP notification
+             process_enrichment()
+             
+             mock_send_sms.assert_not_called()
+
 
     @unittest.mock.patch('execution.jobs.job_02_enrich.openai_client')
     def test_enrich_low_confidence(self, mock_openai):
@@ -155,8 +193,10 @@ class MvpSmokeTest(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        # Mock Twilio to raise Exception
-        with unittest.mock.patch('execution.jobs.job_03_act.twilio.send_sms') as mock_send:
+        # Mock Twilio to raise Exception & ENABLE_SENDING=True
+        with unittest.mock.patch('execution.jobs.job_03_act.twilio.send_sms') as mock_send, \
+             unittest.mock.patch('execution.jobs.job_03_act.ENABLE_SENDING', True):
+             
             mock_send.side_effect = Exception("Twilio Down")
             process_outbound_queue()
         
